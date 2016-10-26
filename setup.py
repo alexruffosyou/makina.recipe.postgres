@@ -51,6 +51,7 @@ setup(name='makina.recipe.postgres',
       namespace_packages=['makina', 'makina.recipe'],
       include_package_data=True,
       zip_safe=False,
+      test_suite='makina.recipe.postgres.tests.test_postgresdocs.test_suite',
       install_requires=['setuptools',
                         'zc.buildout'
                         # -*- Extra requirements: -*-
