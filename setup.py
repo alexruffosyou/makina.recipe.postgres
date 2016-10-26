@@ -52,7 +52,6 @@ setup(name='makina.recipe.postgres',
       include_package_data=True,
       zip_safe=False,
       install_requires=['setuptools',
-                        'zope.testing',
                         'zc.buildout'
                         # -*- Extra requirements: -*-
                         ],

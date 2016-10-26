@@ -24,7 +24,6 @@ import doctest
 import sys
 import os
 
-from zope.testing import doctest
 
 current_dir = os.path.dirname(__file__)
 
