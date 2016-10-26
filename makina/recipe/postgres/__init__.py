@@ -33,12 +33,12 @@ class Recipe(object):
 
     def __init__(self, buildout, name, options):
         """options:
-        
+
           - bin : path to bin folder that contains postgres binaries
           - port : port on wich postgres is started and listen
           - initdb : specify the argument to pass to the initdb command
           - cmds : list of psql cmd to execute after all those init
-        
+
         """
         self.buildout, self.name, self.options = buildout, name, options
         options['location'] = options['prefix'] = os.path.join(

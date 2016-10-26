@@ -22,12 +22,12 @@ from setuptools import setup, find_packages
 
 version = '0.1'
 
-README = os.path.join(os.path.dirname(__file__), 
+README = os.path.join(os.path.dirname(__file__),
                       'makina',
                       'recipe',
                       'postgres', 'docs', 'README.txt')
 
-long_description = open(README).read() + '\n\n' 
+long_description = open(README).read() + '\n\n'
 
 entry_point = 'makina.recipe.postgres:Recipe'
 
