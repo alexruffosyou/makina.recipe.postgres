@@ -18,134 +18,214 @@
 import logging
 import os
 import time
-from random import choice
+import re
+from subprocess import check_call, call, CalledProcessError
 
-pg_ctl_script = """#!/bin/sh
-PGDATA=%s %s/pg_ctl $@
+from zc.buildout import UserError
+
+pg_server_command_template = """#!/bin/bash
+PGDATA={self.pgdata!r} exec {self.pg_bin_dir!r}/{command} "$@"
 """
 
-psql_script = """#!/bin/sh
-%s/psql $@
+pg_client_command_template = """#!/bin/bash
+PGHOST={self.socket_dir!r} PGPORT={self.port} \
+    exec {self.pg_bin_dir!r}/{command} "$@"
 """
+
+pg_command_template_map = {
+    pg_server_command_template: [
+        "pg_ctl",
+        "postgres",
+    ],
+    pg_client_command_template: [
+        "psql",
+        "pg_isready",
+    ],
+}
+
+
+CONFIG_PREFIX = "config."
+
 
 class Recipe(object):
     """This recipe is used by zc.buildout"""
+
+    local_conf_filename = 'postgresql.local.conf'
+    include_local_conf = "include = '{}'".format(local_conf_filename)
+    include_re = re.compile(r"^" + re.escape(include_local_conf))
+    # silence PyLint on missing attributes:
+    bin_pg_ctl = bin_pg_isready = ""
 
     def __init__(self, buildout, name, options):
         """options:
 
           - bin : path to bin folder that contains postgres binaries
+          - pgdata : path to the folder that will contain postgres data
           - port : port on wich postgres is started and listen
           - initdb : specify the argument to pass to the initdb command
+                     or just `true`, which defaults to:
+                     `--auth-local=trust --pgdata=${:pgdata}`
           - cmds : list of psql cmd to execute after all those init
 
         """
         self.buildout, self.name, self.options = buildout, name, options
-        options['location'] = options['prefix'] = os.path.join(
-            buildout['buildout']['parts-directory'],
-            name)
+        if options.get('location') is None:
+            options['location'] = options['prefix'] = os.path.join(
+                buildout['buildout']['parts-directory'],
+                name)
 
-    def system(self, cmd):
-        code = os.system(cmd)
-        if code:
-            error_occured = True
-            raise RuntimeError('Error running command: %s' % cmd)
+        # mandatory options
+        try:
+            self.pgdata = options['pgdata']
+            self.pg_bin_dir = options['bin']
+        except KeyError as e:
+            raise UserError("Missing option in [%s]: %s" % (name, e))
+
+        # options with defaults
+        self.bin_dir = options.setdefault(
+            "bin-directory",
+            # buildout is empty on uninstall, but options should have
+            # bin-directory already set in this case
+            buildout.get('buildout', {}).get('bin-directory', 'bin'),
+
+        )
+        self.socket_dir = options.get('socket_dir', self.pgdata)
+        self.port = options.get('port')
+        options.setdefault(
+            CONFIG_PREFIX + "unix_socket_directories",
+            "'%s'" % self.socket_dir,
+        )
+        options.setdefault(CONFIG_PREFIX + "unix_socket_permissions", "0700")
+        options.setdefault(CONFIG_PREFIX + "listen_addresses", "''")
+
+        if self.port is not None:
+            # non-default port, add to server config file.
+            self.options[CONFIG_PREFIX + "port"] = self.port
+        else:
+            # default port. Needed by pg_client_command_template
+            # FIXME: Can we get the compiled-in default somehow? maybe call
+            # out to postgres with an empty config file...
+            # or make the client env dynamic
+            options['port'] = self.port = '5432'
+
+        if options.get('initdb', '').lower() == 'true':
+            options['initdb'] = "--auth-local=trust --pgdata=" + self.pgdata
+
+        self.cmds = self.options.get('cmds', '').strip()
+
+        self.logger = logging.getLogger(self.name)
 
     def pgdata_exists(self):
-        return os.path.exists(self.options['pgdata']) 
+        return os.path.exists(self.pgdata)
 
     def install(self):
-        """installer"""
-        self.logger = logging.getLogger(self.name)
+        """installer and updater"""
         self.create_bin_scripts()
         if not os.path.exists(self.options['location']):
             os.mkdir(self.options['location'])
-        #Donrt touch an existing database
+        # Don't touch an existing database
         if self.pgdata_exists():
-            self.stopdb()
+            self.configure()
             return self.options['location']
-        self.stopdb()
         self.initdb()
-        self.configure_port()
+        self.configure()
         self.startdb()
         self.do_cmds()
         self.stopdb()
         return self.options['location']
 
-    def update(self):
-        """updater"""
-        self.logger = logging.getLogger(self.name)
-        self.create_bin_scripts()
-        if not self.pgdata_exists():
-            self.stopdb()
-            self.initdb()
-            self.startdb()
-            self.do_cmds()
-        self.configure_port()
-        self.stopdb()
-        return self.options['location']
+    update = install
 
     def startdb(self):
-        if os.path.exists(os.path.join(self.options.get('pgdata'),'postmaster.pid')):
-            self.system('%s restart'%(self.bin_pg_ctl))
+        if self.is_db_started():
+            check_call([self.bin_pg_ctl, 'restart'])
         else:
-            self.system('%s start'%(self.bin_pg_ctl))
-        time.sleep(4)
+            check_call([self.bin_pg_ctl, 'start'])
+        # Wait up to 10 secs for the server to run
+        for _ in range(10):
+            if self.is_db_listening():
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError("Failed to start postgres")
 
     def stopdb(self):
-        if os.path.exists(os.path.join(self.options.get('pgdata'),'postmaster.pid')):
-            self.system('%s stop'%(self.bin_pg_ctl))
+        if self.is_db_started():
+            check_call([self.bin_pg_ctl, 'stop'])
             time.sleep(4)
 
-    def isdbstarted(self):
-        PIDFILE = os.path.join(self.options.get('pgdata'),'postmaster.pid')
-        return os.path.exists(pg_ctl) and os.path.exists(PIDFILE)
+    def is_db_started(self):
+        PIDFILE = os.path.join(self.pgdata, 'postmaster.pid')
+        return os.path.exists(PIDFILE)
+
+    def is_db_listening(self):
+        try:
+            check_call([self.bin_pg_isready])
+            return True
+        except CalledProcessError:
+            return False
 
     def create_bin_scripts(self):
-        buildout_bin_path = self.buildout['buildout']['bin-directory']
-        # Create a wrapper script for psql user and admin
-        psql = os.path.join(buildout_bin_path,'psql')
-        script = open(psql , 'w')
-        script.write(psql_script % (self.options.get('bin')))
-        script.close()
-        os.chmod(psql, 0755)
-        pg_ctl = os.path.join(buildout_bin_path,'pg_ctl')
-        script = open(pg_ctl, 'w')
-        script.write(pg_ctl_script % (self.options.get('pgdata'), self.options.get('bin')))
-        script.close()
-        os.chmod(pg_ctl, 0755)
-        self.bin_pg_ctl = pg_ctl
-        self.bin_psql = psql
-        return pg_ctl, psql
+        # Create a wrapper scripts for client and server commands
+        for template, commands in pg_command_template_map.items():
+            for command in commands:
+                path = os.path.join(self.bin_dir, command)
+                code = template.format(self=self, command=command)
+                with open(path, 'w') as script:
+                    script.write(code)
+                    os.chmod(path, 0755)
+                    # other methods might need this command:
+                    setattr(self, "bin_" + command, path)
+                    # other buildout parts might need this command:
+                    self.options[command] = path
 
     def initdb(self):
-        initdb_options = self.options.get('initdb',None)
-        bin = self.options.get('bin','')
+        initdb_options = self.options.get('initdb', None)
         if initdb_options and not self.pgdata_exists():
-            self.system('%s %s' % (os.path.join(bin, 'initdb'), initdb_options) )
+            initdb = os.path.join(self.pg_bin_dir, 'initdb')
+            check_call('%s %s' % (initdb, initdb_options), shell=True)
 
-    def configure_port(self):
-        port = self.options.get('port',None)
-        if not port: return None
-        self.logger.warning( " !!!!!!!!!!!! " )
-        self.logger.warning( " Warning port is not tested at the moment" )
-        self.logger.warning( " !!!!!!!!!!!! " )
-        # Update the port setting and start up the server
-        #FIXME we need to get pgdata from initdb option
-        conffile = os.path.join(self.options.get('pgdata'),'postgresql.conf')
-        f = open(conffile)
-        conf = ('port = %s' % port).join(f.read().split('#port = 5432'))
-        f.close()
-        open(conffile, 'w').write(conf)
+    def configure(self):
+        conf_dir = self.pgdata
+
+        # include local configuration file
+        conf_file = os.path.join(conf_dir, 'postgresql.conf')
+        with open(conf_file) as f:
+            conf = f.read()
+        if not self.include_re.search(conf):
+            self.logger.info("including local configuration")
+            conf += "\n\n%s\n" % self.include_local_conf
+            with open(conf_file, 'w') as f:
+                f.write(conf)
+
+        # Write local configuration file:
+        local_conf = "\n".join(
+            "{name} = {value}".format(
+                name=name.split(".", 1)[1],
+                value=self.options[name],
+            )
+            for name in sorted(self.options.keys())
+            if name.startswith(CONFIG_PREFIX)
+        )
+        with open(os.path.join(conf_dir, self.local_conf_filename), "w") as f:
+            self.logger.info("Writing local configuration")
+            f.write(local_conf)
 
     def do_cmds(self):
-        cmds = self.options.get('cmds', None)
-        bin = self.options.get('bin')
-        if not cmds: return None
-        cmds = cmds.split(os.linesep)
+        if not self.cmds:
+            return None
+        cmds = self.cmds.split(os.linesep)
+
+        env = dict(PGHOST=self.socket_dir, PGPORT=self.port)
         for cmd in cmds:
-            if not cmd: continue
-            try: self.system('%s/%s' % (bin, cmd))
-            except RuntimeError, e:
-                pass
-        dest = self.options['location']
+            if not cmd:
+                continue
+            cmd = ['%s/%s' % (self.pg_bin_dir, cmd)]
+            self.logger.info(
+                "running command: %s with additional env %s", cmd, env,
+            )
+            call(cmd, shell=True, env=dict(os.environ, **env))
+
+
+def uninstall(name, options):
+    Recipe({}, name, options).stopdb()
