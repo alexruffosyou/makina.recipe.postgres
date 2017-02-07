@@ -40,6 +40,8 @@ pg_command_template_map = {
     pg_client_command_template: [
         "psql",
         "pg_isready",
+        "pg_dump",
+        "pg_restore",
     ],
 }
 
