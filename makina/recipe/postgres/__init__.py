@@ -23,13 +23,32 @@ from subprocess import check_call, call, CalledProcessError
 
 from zc.buildout import UserError
 
+pg_server_env = "PGDATA={self.pgdata!r}"
+
 pg_server_command_template = """#!/bin/bash
-PGDATA={self.pgdata!r} exec {self.pg_bin_dir!r}/{command} "$@"
+{self.pg_server_env} exec {self.pg_bin_dir!r}/{command} "$@"
 """
 
+pg_client_env = "PGHOST={self.socket_dir!r} PGPORT={self.port}"
+
 pg_client_command_template = """#!/bin/bash
-PGHOST={self.socket_dir!r} PGPORT={self.port} \
-    exec {self.pg_bin_dir!r}/{command} "$@"
+{self.pg_client_env} exec {self.pg_bin_dir!r}/{command} "$@"
+"""
+
+pg_shift_command_template = """#!/bin/bash
+read -r -d '' USAGE <<EOM
+Usage:
+
+$0 <command> [args ...]
+EOM
+
+if [[ $# -eq 0 ]]; then
+	echo $USAGE
+	exit 1
+fi
+command=$1
+shift
+{env} exec {self.pg_bin_dir!r}/$command "$@"
 """
 
 pg_command_template_map = {
@@ -114,6 +133,8 @@ class Recipe(object):
         self.cmds = self.options.get('cmds', '').strip()
 
         self.logger = logging.getLogger(self.name)
+        self.pg_server_env = pg_server_env.format(self=self)
+        self.pg_client_env = pg_client_env.format(self=self)
 
     def pgdata_exists(self):
         return os.path.exists(self.pgdata)
@@ -166,18 +187,28 @@ class Recipe(object):
             return False
 
     def create_bin_scripts(self):
-        # Create a wrapper scripts for client and server commands
+        # Create wrapper scripts for specific client and server commands
         for template, commands in pg_command_template_map.items():
             for command in commands:
-                path = os.path.join(self.bin_dir, command)
                 code = template.format(self=self, command=command)
-                with open(path, 'w') as script:
-                    script.write(code)
-                    os.chmod(path, 0755)
-                    # other methods might need this command:
-                    setattr(self, "bin_" + command, path)
-                    # other buildout parts might need this command:
-                    self.options[command] = path
+                self.create_bin_script(command, code)
+        # Create wrapper scripts for generic client and server commands
+        for suffix, env in [
+                ('server', self.pg_server_env),
+                ('client', self.pg_client_env),
+            ]:
+            code = pg_shift_command_template.format(self=self, env=env)
+            self.create_bin_script(self.name + "_" + suffix, code)
+
+    def create_bin_script(self, command, code):
+        path = os.path.join(self.bin_dir, command)
+        with open(path, 'w') as script:
+            script.write(code)
+            os.chmod(path, 0755)
+            # other methods might need this command:
+            setattr(self, "bin_" + command, path)
+            # other buildout parts might need this command:
+            self.options[command] = path
 
     def initdb(self):
         initdb_options = self.options.get('initdb', None)
